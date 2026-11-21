@@ -1,7 +1,9 @@
 # Lantern Heist
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![make.fun bounty](https://img.shields.io/badge/make.fun-best--stealth--game-blue)](https://make.fun/c/best-stealth-game-20261121-1759)
+[![make.fun · best-stealth-game-20261121-1759](https://make.fun/badge/best-stealth-game-20261121-1759.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
+[![rank](https://make.fun/badge/best-stealth-game-20261121-1759/khaliefk/best-stealth-game-20261121-1759/rank.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759/leaderboard)
+[![reward](https://make.fun/badge/best-stealth-game-20261121-1759/khaliefk/best-stealth-game-20261121-1759/reward.svg)](https://make.fun/bounty/best-stealth-game-20261121-1759)
 [![Node](https://img.shields.io/badge/Node-%3E%3D22.18-green)](https://nodejs.org)
 
 A top-down stealth game for the [make.fun](https://make.fun/c/best-stealth-game-20261121-1759)
