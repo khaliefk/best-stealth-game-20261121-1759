@@ -1,160 +1,82 @@
-// The screenshot scenes behind ?shot=start|play|alert|win. Each one plays the real rules
-// forward from a fresh world, steered by a simple autopilot (move toward the nearest
-// relic, keep out of every vision cone), so the frame is what a short game really looks
-// like and the same seed always gives the same frame.
-import { FIELD, STEP, TILE } from './config.js';
-import { EVENT_LEVEL_CLEAR, EVENT_WIN } from './world.js';
+// Lantern Heist: the staged scenes behind ?shot=start|play|alarm|win. Each one plays the real
+// rules forward from a fresh world — a scripted route for the play scene, a walk into a guard's
+// cone for the alarm scene — so the frame is what the game really looks like, and the same
+// seed always gives the same frame.
+import { STEP, TILE } from './config.js';
 import { SCREEN_OVER, SCREEN_PLAY, SCREEN_TITLE, SCREEN_WIN } from './render.js';
 
-const START_SECONDS = 5;
-const PLAY_SECONDS = 14;
-
-const DIRS = [
-  [0, 0],
-  [1, 0],
-  [-1, 0],
-  [0, 1],
-  [0, -1],
-  [1, 1],
-  [1, -1],
-  [-1, 1],
-  [-1, -1],
-];
-
-function angleDiff(a, b) {
-  let d = b - a;
-  while (d > Math.PI) d -= Math.PI * 2;
-  while (d < -Math.PI) d += Math.PI * 2;
-  return Math.abs(d);
+/** Steer the thief toward a pixel target for one step, sneaking when asked. */
+function steer(world, tx, ty, sneak) {
+  const p = world.state.player;
+  const dx = tx - p.x;
+  const dy = ty - p.y;
+  const len = Math.hypot(dx, dy);
+  if (len < 2) return { x: 0, y: 0 };
+  return { x: dx / len, y: dy / len };
 }
 
-/** True when the straight line between two points crosses no solid tile. */
-function clearLine(state, ax, ay, bx, by) {
-  const dx = bx - ax;
-  const dy = by - ay;
-  const dist = Math.hypot(dx, dy);
-  const steps = Math.max(1, Math.ceil(dist / 6));
-  for (let i = 1; i < steps; i += 1) {
-    const t = i / steps;
-    const tx = Math.floor((ax + dx * t) / TILE);
-    const ty = Math.floor((ay + dy * t) / TILE);
-    if (tx < 0 || ty < 0 || tx >= 32 || ty >= 18 || state.solid[ty * 32 + tx] === 1) return false;
+/** Follow a list of tile waypoints for up to `seconds`, then stop. */
+function walkRoute(world, tiles, seconds, sneakFrom) {
+  let elapsed = 0;
+  let wp = 0;
+  while (elapsed < seconds) {
+    const target = tiles[Math.min(wp, tiles.length - 1)];
+    const tx = target[0] * TILE + 16;
+    const ty = target[1] * TILE + 16;
+    const p = world.state.player;
+    if (Math.hypot(tx - p.x, ty - p.y) < 14 && wp < tiles.length - 1) wp += 1;
+    const dir = steer(world, tx, ty, false);
+    world.step(STEP, dir, elapsed >= sneakFrom, null);
+    elapsed += STEP;
+    if (world.state.over || world.state.won) break;
   }
-  return true;
-}
-
-/** How exposed the point (x, y) is to the guards: 0 when no cone reaches it. */
-function exposure(state, x, y) {
-  let worst = 0;
-  for (const guard of state.guards) {
-    const dx = x - guard.x;
-    const dy = y - guard.y;
-    const dist = Math.hypot(dx, dy);
-    if (dist > 250) continue;
-    if (dist > 1 && angleDiff(guard.angle, Math.atan2(dy, dx)) > 0.46) continue;
-    if (!clearLine(state, guard.x, guard.y, x, y)) continue;
-    worst = Math.max(worst, 1 - dist / 400);
-    if (dist < 70) worst = Math.max(worst, 1.5);
-  }
-  for (const camera of state.cameras) {
-    const dx = x - camera.x;
-    const dy = y - camera.y;
-    const dist = Math.hypot(dx, dy);
-    if (dist > 230) continue;
-    if (dist > 1 && angleDiff(camera.angle, Math.atan2(dy, dx)) > 0.42) continue;
-    if (!clearLine(state, camera.x, camera.y, x, y)) continue;
-    worst = Math.max(worst, 1 - dist / 400);
-  }
-  return worst;
-}
-
-/** The autopilot: of the nine ways to move, the one closest to the target that no cone sees. */
-function autopilot(state) {
-  const p = state.player;
-  let target = null;
-  let targetDist = Infinity;
-  for (const relic of state.relics) {
-    if (relic.taken) continue;
-    const d = Math.hypot(relic.x - p.x, relic.y - p.y);
-    if (d < targetDist) {
-      targetDist = d;
-      target = relic;
-    }
-  }
-  if (!target) target = state.exit;
-  let best = DIRS[0];
-  let bestScore = Infinity;
-  for (const [dx, dy] of DIRS) {
-    const x = p.x + dx * 30;
-    const y = p.y + dy * 30;
-    if (x < TILE || y < TILE || x > FIELD.width - TILE || y > FIELD.height - TILE) continue;
-    const tx = Math.floor(x / TILE);
-    const ty = Math.floor(y / TILE);
-    if (state.solid[ty * 32 + tx] === 1) continue;
-    // A step is priced by how far it leaves the player from the target, how exposed
-    // the step and the step after it are to any cone, and how close any guard is:
-    // the pilot would rather wait than walk into a patrol's path.
-    let score = Math.hypot(target.x - x, target.y - y);
-    score += exposure(state, x, y) * 1500;
-    score += exposure(state, x + dx * 30, y + dy * 30) * 750;
-    for (const guard of state.guards) {
-      const d = Math.hypot(guard.x - x, guard.y - y);
-      if (d < 140) score += (140 - d) * 8;
-    }
-    if (score < bestScore) {
-      bestScore = score;
-      best = [dx, dy];
-    }
-  }
-  return { mx: best[0], my: best[1], run: false, throwCoin: null };
 }
 
 /**
- * Set `world` to the named scene (start, play, alert or win; any other name is start)
- * and return the screen to draw over it, the best score to show and the panel info.
+ * Set `world` to the named scene and return the screen to draw over it and the best score.
+ * Unknown names stage the title scene.
  */
 export function stageShot(name, world) {
-  const { state } = world;
-  world.resetRun();
-  if (name === 'win') {
-    world.loadLevel(2);
-    for (const relic of state.relics) relic.taken = true;
-    state.relicsTaken = state.relics.length;
-    state.exit.open = true;
-    state.score = 1250;
-    state.player.x = state.exit.x - 60;
-    state.player.y = state.exit.y;
-    return { screen: SCREEN_WIN, best: 1250, info: null };
-  }
-  if (name === 'alert') {
-    for (let i = 0; i < 3 / STEP; i += 1) world.step(STEP, { mx: 0, my: 0, run: false, throwCoin: null });
-    const guard = state.guards[0];
-    // Put the player just inside the guard's cone, far enough that the guard cannot
-    // reach him in the few frames the scene runs: the frame catches the guard
-    // suspicious, his cone orange, his detection ring nearly full.
-    state.player.x = guard.x + Math.cos(guard.angle) * 120;
-    state.player.y = guard.y + Math.sin(guard.angle) * 120;
-    guard.detection = 0.7;
-    guard.state = 'suspicious';
-    guard.target.x = state.player.x;
-    guard.target.y = state.player.y;
-    guard.search = 3;
-    for (let i = 0; i < 0.25 / STEP; i += 1) {
-      world.step(STEP, { mx: 0, my: 0, run: false, throwCoin: null });
-    }
-    return { screen: SCREEN_PLAY, best: 0, info: null };
-  }
+  world.reset();
   if (name === 'play') {
-    // A caught player respawns and the pilot keeps sneaking: the scene runs the full
-    // time either way, so the frame is a game in progress, not a respawn.
-    for (let i = 0; i < PLAY_SECONDS / STEP; i += 1) {
-      const events = world.step(STEP, autopilot(state));
-      if (events & (EVENT_LEVEL_CLEAR | EVENT_WIN)) break;
+    // Around the crate, down the gap into the great hall, across it, then sneak toward the
+    // far crates while a guard's cone sweeps past: the frame shows cones, cover, a lantern
+    // and the thief mid-sneak.
+    walkRoute(world, [[2, 3], [2, 5], [4, 6], [4, 7], [10, 8], [16, 10], [24, 12]], 14, 10);
+    return { screen: SCREEN_PLAY, best: 0 };
+  }
+  if (name === 'alarm') {
+    // Stand ahead of the first guard, off to one side of its cone, until it spots the thief,
+    // then slip away up the hall: the frame catches the alarm banner and the red cone.
+    const guard = world.state.guards[0];
+    world.state.player.x = guard.x + 140;
+    world.state.player.y = guard.y - 40;
+    let elapsed = 0;
+    while (elapsed < 6 && !world.state.alarm) {
+      world.step(STEP, { x: 0, y: 0 }, false, null);
+      elapsed += STEP;
     }
-    return { screen: state.lives === 0 ? SCREEN_OVER : SCREEN_PLAY, best: state.score, info: null };
+    // A few more steps so the chase is visibly under way, without getting caught.
+    for (let i = 0; i < 25; i += 1) world.step(STEP, { x: 0.3, y: -1 }, false, null);
+    return { screen: SCREEN_PLAY, best: 0 };
   }
-  for (let i = 0; i < START_SECONDS / STEP; i += 1) {
-    world.step(STEP, { mx: 0, my: 0, run: false, throwCoin: null });
+  if (name === 'win') {
+    // The victory screen over the last floor, with a finished run's numbers.
+    world.loadFloor(2);
+    for (const relic of world.state.floor.relics) relic.taken = true;
+    world.state.relicsTaken = world.state.floor.relics.length;
+    world.state.score = 12480;
+    world.state.totalTime = 512;
+    world.state.won = true;
+    world.state.message = '';
+    world.state.messageTimer = 0;
+    return { screen: SCREEN_WIN, best: 12480 };
   }
-  return { screen: SCREEN_TITLE, best: 0, info: null };
+  // Title: let the guards patrol for a few seconds behind the title card.
+  let elapsed = 0;
+  while (elapsed < 5) {
+    world.step(STEP, { x: 0, y: 0 }, false, null);
+    elapsed += STEP;
+  }
+  return { screen: SCREEN_TITLE, best: 0 };
 }

@@ -1,9 +1,10 @@
-// Drawing only: the world's state and the current screen in, pixels out. The 1280x720
-// playfield is scaled to fit the window and centred, the margin filled with the
-// backdrop colour. Vision cones are painted over the floor and under the walls, so a
-// wall cuts a cone the way it should. Everything is drawn in code: flat shapes,
-// canvas gradients for lamplight, and text for the HUD and the panels.
-import { COLS, FIELD, FONT, PALETTE, ROWS, TILE } from './config.js';
+// Lantern Heist: everything the player sees. Top-down canvas painting: wooden floors, stone
+// walls, crates and bushes, warm lantern pools, relics, the exit door, guards with ray-cast
+// vision cones that stop at walls, the hooded thief, and a darkness pass that leaves light
+// only around the thief and the lanterns. The HUD and the title, pause, clear, caught and
+// victory screens are drawn here too, so a screenshot is always one draw call away.
+import { COLORS, COLS, GAME, ROWS, TILE, VIEW_HEIGHT, VIEW_WIDTH, VISION } from './config.js';
+import { FLOORS, isSolid } from './levels.js';
 
 export const SCREEN_TITLE = 'title';
 export const SCREEN_PLAY = 'play';
@@ -12,434 +13,401 @@ export const SCREEN_CLEAR = 'clear';
 export const SCREEN_OVER = 'over';
 export const SCREEN_WIN = 'win';
 
-const PANEL = { width: 640, top: 150, line: 34, bottom: 76 };
-
-function cachedLabel(prefix) {
-  let value = -1;
-  let text = '';
-  return function label(next) {
-    if (next !== value) {
-      value = next;
-      text = prefix + next;
-    }
-    return text;
-  };
+/** A cheap deterministic hash, so each floor tile gets its own stable shade and speckle. */
+function hash2(x, y) {
+  let h = (x * 374761393 + y * 668265263) ^ 0x5bf03635;
+  h = (h ^ (h >> 13)) * 1274126177;
+  return ((h ^ (h >> 16)) >>> 0) / 4294967295;
 }
 
 export function createRenderer(canvas) {
-  const context = canvas.getContext('2d');
-  const view = { scale: 1, x: 0, y: 0 };
-  const scoreLabel = cachedLabel('Score ');
-  const bestLabel = cachedLabel('Best ');
-  const finalLabel = cachedLabel('Score ');
+  canvas.width = VIEW_WIDTH;
+  canvas.height = VIEW_HEIGHT;
+  const ctx = canvas.getContext('2d');
+  const dark = document.createElement('canvas');
+  dark.width = VIEW_WIDTH;
+  dark.height = VIEW_HEIGHT;
+  const dctx = dark.getContext('2d');
 
-  function resize() {
-    const ratio = window.devicePixelRatio || 1;
-    const width = Math.round(window.innerWidth * ratio);
-    const height = Math.round(window.innerHeight * ratio);
-    canvas.width = width;
-    canvas.height = height;
-    view.scale = Math.min(width / FIELD.width, height / FIELD.height);
-    view.x = (width - FIELD.width * view.scale) / 2;
-    view.y = (height - FIELD.height * view.scale) / 2;
-  }
-
-  const fonts = new Map();
-  function text(value, x, y, size, color, align) {
-    if (!fonts.has(size)) fonts.set(size, `${size}px ${FONT}`);
-    context.font = fonts.get(size);
-    context.fillStyle = color;
-    context.textAlign = align;
-    context.fillText(value, x, y);
-  }
-
-  function wedge(x, y, angle, range, halfAngle, fill, edge) {
-    context.beginPath();
-    context.moveTo(x, y);
-    context.arc(x, y, range, angle - halfAngle, angle + halfAngle);
-    context.closePath();
-    context.fillStyle = fill;
-    context.fill();
-    context.strokeStyle = edge;
-    context.lineWidth = 1.5;
-    context.beginPath();
-    context.moveTo(x, y);
-    context.lineTo(x + Math.cos(angle - halfAngle) * range, y + Math.sin(angle - halfAngle) * range);
-    context.moveTo(x, y);
-    context.lineTo(x + Math.cos(angle + halfAngle) * range, y + Math.sin(angle + halfAngle) * range);
-    context.stroke();
-  }
-
-  function drawFloor(state) {
+  function drawFloor(floor) {
     for (let ty = 0; ty < ROWS; ty += 1) {
       for (let tx = 0; tx < COLS; tx += 1) {
-        context.fillStyle = (tx + ty) % 2 === 0 ? PALETTE.floorA : PALETTE.floorB;
-        context.fillRect(tx * TILE, ty * TILE, TILE, TILE);
-      }
-    }
-    context.strokeStyle = PALETTE.floorLine;
-    context.lineWidth = 1;
-    context.beginPath();
-    for (let tx = 0; tx <= COLS; tx += 1) {
-      context.moveTo(tx * TILE, 0);
-      context.lineTo(tx * TILE, FIELD.height);
-    }
-    for (let ty = 0; ty <= ROWS; ty += 1) {
-      context.moveTo(0, ty * TILE);
-      context.lineTo(FIELD.width, ty * TILE);
-    }
-    context.stroke();
-    // Warm pools of light under the lamps.
-    for (const lamp of state.lamps) {
-      const glow = context.createRadialGradient(lamp.x, lamp.y, 8, lamp.x, lamp.y, 110);
-      glow.addColorStop(0, 'rgba(247, 201, 72, 0.20)');
-      glow.addColorStop(1, 'rgba(247, 201, 72, 0)');
-      context.fillStyle = glow;
-      context.fillRect(lamp.x - 110, lamp.y - 110, 220, 220);
-      context.fillStyle = PALETTE.lampGlow;
-      context.beginPath();
-      context.arc(lamp.x, lamp.y, 5, 0, Math.PI * 2);
-      context.fill();
-    }
-  }
-
-  function drawCones(state) {
-    for (const guard of state.guards) {
-      const alert = guard.state === 'chase';
-      const wary = guard.state === 'suspicious' || guard.detection > 0.45;
-      const fill = alert ? PALETTE.coneAlert : wary ? PALETTE.coneSuspicious : PALETTE.coneCalm;
-      const edge = alert ? PALETTE.coneAlertEdge : wary ? PALETTE.coneSuspiciousEdge : PALETTE.coneCalmEdge;
-      wedge(guard.x, guard.y, guard.angle, 250, 0.46, fill, edge);
-    }
-    for (const camera of state.cameras) {
-      const wary = camera.detection > 0.45;
-      wedge(
-        camera.x,
-        camera.y,
-        camera.angle,
-        230,
-        0.42,
-        wary ? PALETTE.coneSuspicious : PALETTE.coneCalm,
-        wary ? PALETTE.coneSuspiciousEdge : PALETTE.coneCalmEdge,
-      );
-    }
-  }
-
-  function drawWallsAndCover(state) {
-    for (let ty = 0; ty < ROWS; ty += 1) {
-      for (let tx = 0; tx < COLS; tx += 1) {
-        if (state.solid[ty * COLS + tx] !== 1) continue;
         const x = tx * TILE;
         const y = ty * TILE;
-        context.fillStyle = PALETTE.wall;
-        context.fillRect(x, y, TILE, TILE);
-        context.fillStyle = PALETTE.wallTop;
-        context.fillRect(x, y, TILE, 5);
-      }
-    }
-    // Crates sit on the solid grid too, but read as boxes, not wall: repaint them.
-    for (const [cx, cy, w, h] of state.level.crates) {
-      for (let ty = cy; ty < cy + h; ty += 1) {
-        for (let tx = cx; tx < cx + w; tx += 1) {
-          const x = tx * TILE;
-          const y = ty * TILE;
-          context.fillStyle = PALETTE.crate;
-          context.fillRect(x + 3, y + 3, TILE - 6, TILE - 6);
-          context.fillStyle = PALETTE.crateTop;
-          context.fillRect(x + 3, y + 3, TILE - 6, 8);
-          context.strokeStyle = PALETTE.crateEdge;
-          context.lineWidth = 2;
-          context.strokeRect(x + 3, y + 3, TILE - 6, TILE - 6);
-          context.beginPath();
-          context.moveTo(x + 3, y + 3);
-          context.lineTo(x + TILE - 3, y + TILE - 3);
-          context.moveTo(x + TILE - 3, y + 3);
-          context.lineTo(x + 3, y + TILE - 3);
-          context.stroke();
+        const h = hash2(tx, ty);
+        if (floor.walls.has(`${tx},${ty}`)) {
+          ctx.fillStyle = COLORS.wall;
+          ctx.fillRect(x, y, TILE, TILE);
+          ctx.fillStyle = COLORS.wallTop;
+          ctx.fillRect(x, y, TILE, 4);
+          ctx.fillStyle = COLORS.wallDark;
+          ctx.fillRect(x, y + TILE - 4, TILE, 4);
+          ctx.fillStyle = 'rgba(0,0,0,0.25)';
+          ctx.fillRect(x + 8, y + 10, 3, 3);
+          ctx.fillRect(x + 20, y + 18, 3, 3);
+          continue;
+        }
+        ctx.fillStyle = (tx + ty) % 2 === 0 ? COLORS.floorA : COLORS.floorB;
+        ctx.fillRect(x, y, TILE, TILE);
+        // Wood planks: a darker seam every other row and a speckle per tile.
+        ctx.fillStyle = 'rgba(0,0,0,0.18)';
+        ctx.fillRect(x, y + TILE - 1, TILE, 1);
+        if (ty % 2 === 0) ctx.fillRect(x + (h > 0.5 ? 16 : 0), y, 1, TILE);
+        ctx.fillStyle = `rgba(255,220,150,${0.02 + h * 0.03})`;
+        ctx.fillRect(x + 4 + h * 20, y + 6 + h * 16, 3, 3);
+        if (floor.cover.has(`${tx},${ty}`)) {
+          ctx.fillStyle = COLORS.crate;
+          ctx.fillRect(x + 3, y + 3, TILE - 6, TILE - 6);
+          ctx.strokeStyle = COLORS.crateEdge;
+          ctx.lineWidth = 2;
+          ctx.strokeRect(x + 3.5, y + 3.5, TILE - 7, TILE - 7);
+          ctx.beginPath();
+          ctx.moveTo(x + 3, y + 3);
+          ctx.lineTo(x + TILE - 3, y + TILE - 3);
+          ctx.moveTo(x + TILE - 3, y + 3);
+          ctx.lineTo(x + 3, y + TILE - 3);
+          ctx.stroke();
+        } else if (floor.bushes.has(`${tx},${ty}`)) {
+          ctx.fillStyle = COLORS.bush;
+          ctx.beginPath();
+          ctx.arc(x + 10, y + 12, 9, 0, Math.PI * 2);
+          ctx.arc(x + 22, y + 10, 10, 0, Math.PI * 2);
+          ctx.arc(x + 16, y + 22, 10, 0, Math.PI * 2);
+          ctx.fill();
+          ctx.fillStyle = COLORS.bushLight;
+          ctx.beginPath();
+          ctx.arc(x + 12, y + 10, 4, 0, Math.PI * 2);
+          ctx.arc(x + 22, y + 20, 4, 0, Math.PI * 2);
+          ctx.fill();
         }
       }
     }
-    for (let ty = 0; ty < ROWS; ty += 1) {
-      for (let tx = 0; tx < COLS; tx += 1) {
-        if (state.bush[ty * COLS + tx] !== 1) continue;
-        const x = tx * TILE;
-        const y = ty * TILE;
-        context.fillStyle = PALETTE.bush;
-        context.fillRect(x, y, TILE, TILE);
-        context.fillStyle = PALETTE.bushLeaf;
-        for (let i = 0; i < 5; i += 1) {
-          const bx = x + 6 + ((i * 13) % 28);
-          const by = y + 6 + ((i * 17) % 28);
-          context.beginPath();
-          context.arc(bx, by, 6, 0, Math.PI * 2);
-          context.fill();
-        }
-        context.fillStyle = PALETTE.bushDeep;
-        context.beginPath();
-        context.arc(x + TILE / 2, y + TILE / 2, 5, 0, Math.PI * 2);
-        context.fill();
-      }
+    // Lanterns: a post, a warm core and a pool of light on the floor.
+    for (const lamp of floor.lanterns) {
+      const glow = ctx.createRadialGradient(lamp.x, lamp.y, 4, lamp.x, lamp.y, 110);
+      glow.addColorStop(0, COLORS.lanternGlow);
+      glow.addColorStop(1, 'rgba(255,190,90,0)');
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(lamp.x, lamp.y, 110, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#1a1208';
+      ctx.fillRect(lamp.x - 2, lamp.y - 12, 4, 24);
+      ctx.fillStyle = COLORS.lanternCore;
+      ctx.beginPath();
+      ctx.arc(lamp.x, lamp.y, 7, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.fillStyle = '#fff6d8';
+      ctx.beginPath();
+      ctx.arc(lamp.x, lamp.y, 3, 0, Math.PI * 2);
+      ctx.fill();
     }
   }
 
-  function drawRelicsAndExit(state, time) {
-    for (const relic of state.relics) {
+  function drawExit(floor, taken, time) {
+    const e = floor.exit;
+    const open = taken;
+    const pulse = 0.6 + 0.4 * Math.sin(time * 3);
+    ctx.save();
+    ctx.translate(e.x, e.y);
+    ctx.fillStyle = open ? COLORS.exitOpen : COLORS.exitLocked;
+    ctx.globalAlpha = open ? 0.5 + 0.4 * pulse : 0.85;
+    ctx.beginPath();
+    ctx.arc(0, 0, 20, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.globalAlpha = 1;
+    ctx.fillStyle = '#101018';
+    ctx.fillRect(-11, -14, 22, 28);
+    ctx.fillStyle = open ? COLORS.exitOpen : COLORS.exitLocked;
+    ctx.fillRect(-11, -14, 22, 4);
+    ctx.fillStyle = COLORS.text;
+    ctx.font = 'bold 13px Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(open ? 'EXIT' : 'LOCK', 0, 1);
+    ctx.restore();
+  }
+
+  function drawRelics(floor, time) {
+    for (const relic of floor.relics) {
       if (relic.taken) continue;
-      const pulse = 1 + Math.sin(time * 0.004 + relic.x) * 0.12;
-      const glow = context.createRadialGradient(relic.x, relic.y, 2, relic.x, relic.y, 34 * pulse);
-      glow.addColorStop(0, 'rgba(255, 217, 77, 0.5)');
-      glow.addColorStop(1, 'rgba(255, 217, 77, 0)');
-      context.fillStyle = glow;
-      context.fillRect(relic.x - 34, relic.y - 34, 68, 68);
-      context.save();
-      context.translate(relic.x, relic.y);
-      context.rotate(Math.PI / 4);
-      context.fillStyle = PALETTE.relic;
-      context.fillRect(-9, -9, 18, 18);
-      context.fillStyle = PALETTE.relicGlow;
-      context.fillRect(-5, -5, 10, 10);
-      context.restore();
-    }
-    const exit = state.exit;
-    const open = exit.open;
-    const pulse = open ? 1 + Math.sin(time * 0.006) * 0.15 : 1;
-    const glow = context.createRadialGradient(exit.x, exit.y, 4, exit.x, exit.y, 46 * pulse);
-    glow.addColorStop(0, open ? 'rgba(57, 217, 138, 0.55)' : 'rgba(90, 107, 98, 0.35)');
-    glow.addColorStop(1, 'rgba(57, 217, 138, 0)');
-    context.fillStyle = glow;
-    context.fillRect(exit.x - 46, exit.y - 46, 92, 92);
-    context.fillStyle = open ? PALETTE.exit : PALETTE.exitLocked;
-    context.fillRect(exit.x - 16, exit.y - 16, 32, 32);
-    context.fillStyle = PALETTE.backdrop;
-    context.font = `bold 20px ${FONT}`;
-    context.textAlign = 'center';
-    context.textBaseline = 'middle';
-    context.fillText(open ? '>' : 'x', exit.x, exit.y + 1);
-    context.textBaseline = 'alphabetic';
-    text(open ? 'EXIT OPEN' : 'LOCKED', exit.x, exit.y + 30, 11, open ? PALETTE.exit : PALETTE.muted, 'center');
-  }
-
-  function drawNoiseFlashes(state) {
-    for (const flash of state.noiseFlashes) {
-      const t = flash.age / 0.7;
-      context.strokeStyle = `rgba(255, 255, 255, ${0.6 * (1 - t)})`;
-      context.lineWidth = 2;
-      context.beginPath();
-      context.arc(flash.x, flash.y, 10 + t * flash.radius, 0, Math.PI * 2);
-      context.stroke();
+      const bob = Math.sin(time * 2 + relic.x) * 3;
+      const glow = ctx.createRadialGradient(relic.x, relic.y + bob, 2, relic.x, relic.y + bob, 30);
+      glow.addColorStop(0, COLORS.relicGlow);
+      glow.addColorStop(1, 'rgba(255,217,74,0)');
+      ctx.fillStyle = glow;
+      ctx.beginPath();
+      ctx.arc(relic.x, relic.y + bob, 30, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.save();
+      ctx.translate(relic.x, relic.y + bob);
+      ctx.rotate(Math.PI / 4);
+      ctx.fillStyle = COLORS.relic;
+      ctx.fillRect(-8, -8, 16, 16);
+      ctx.fillStyle = '#fff3b0';
+      ctx.fillRect(-4, -4, 8, 8);
+      ctx.restore();
+      if (Math.sin(time * 4 + relic.y) > 0.6) {
+        ctx.fillStyle = '#ffffff';
+        ctx.fillRect(relic.x + 10, relic.y - 12 + bob, 2, 2);
+      }
     }
   }
 
-  function drawThrownCoin(state) {
-    const coin = state.thrownCoin;
-    if (!coin) return;
-    const t = coin.t;
-    const x = coin.x + (coin.tx - coin.x) * t;
-    const y = coin.y + (coin.ty - coin.y) * t - Math.sin(t * Math.PI) * 26;
-    context.fillStyle = PALETTE.gold;
-    context.beginPath();
-    context.arc(x, y, 6, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = '#fff6c9';
-    context.beginPath();
-    context.arc(x - 1.5, y - 1.5, 2.5, 0, Math.PI * 2);
-    context.fill();
+  /** Cast one ray of the cone until it hits a wall or runs out of range. */
+  function rayLength(floor, gx, gy, angle) {
+    const step = 6;
+    for (let d = step; d <= VISION.range; d += step) {
+      const x = gx + Math.cos(angle) * d;
+      const y = gy + Math.sin(angle) * d;
+      if (isSolid(floor, Math.floor(x / TILE), Math.floor(y / TILE))) return d;
+    }
+    return VISION.range;
   }
 
-  function drawPlayer(state) {
+  function drawCones(floor, guards, alarm) {
+    for (const guard of guards) {
+      const rays = 26;
+      ctx.beginPath();
+      ctx.moveTo(guard.x, guard.y);
+      for (let i = 0; i <= rays; i += 1) {
+        const a = guard.facing - VISION.halfAngle + (2 * VISION.halfAngle * i) / rays;
+        const len = rayLength(floor, guard.x, guard.y, a);
+        ctx.lineTo(guard.x + Math.cos(a) * len, guard.y + Math.sin(a) * len);
+      }
+      ctx.closePath();
+      ctx.fillStyle = alarm
+        ? COLORS.coneAlarm
+        : guard.suspicion > 0.35
+          ? COLORS.coneSuspicious
+          : COLORS.coneCalm;
+      ctx.fill();
+    }
+  }
+
+  function drawGuard(guard, alarm, time) {
+    // A coloured ring under the guard shows how suspicious it is.
+    if (guard.suspicion > 0.05) {
+      ctx.strokeStyle = guard.suspicion > 0.7 ? '#ff5040' : '#ffb020';
+      ctx.lineWidth = 3;
+      ctx.beginPath();
+      ctx.arc(guard.x, guard.y, 18, -Math.PI / 2, -Math.PI / 2 + guard.suspicion * Math.PI * 2);
+      ctx.stroke();
+    }
+    ctx.save();
+    ctx.translate(guard.x, guard.y);
+    ctx.rotate(guard.facing);
+    // Body: a dark blue tabard with a helmet and a spear pointing where it looks.
+    ctx.fillStyle = COLORS.guard;
+    ctx.beginPath();
+    ctx.arc(0, 0, guard.radius, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = COLORS.guardHelmet;
+    ctx.beginPath();
+    ctx.arc(2, 0, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.strokeStyle = '#c8ccd4';
+    ctx.lineWidth = 2;
+    ctx.beginPath();
+    ctx.moveTo(6, 0);
+    ctx.lineTo(20, 0);
+    ctx.stroke();
+    ctx.restore();
+    if (alarm || guard.suspicion > 0.85) {
+      ctx.fillStyle = '#ff5040';
+      ctx.font = 'bold 20px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('!', guard.x, guard.y - 22 - Math.sin(time * 6) * 2);
+    }
+  }
+
+  function drawPlayer(player, time) {
+    ctx.save();
+    ctx.translate(player.x, player.y);
+    // A soft pool of light the thief carries.
+    const glow = ctx.createRadialGradient(0, 0, 4, 0, 0, 60);
+    glow.addColorStop(0, 'rgba(255,220,140,0.25)');
+    glow.addColorStop(1, 'rgba(255,220,140,0)');
+    ctx.fillStyle = glow;
+    ctx.beginPath();
+    ctx.arc(0, 0, 60, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.rotate(player.facing);
+    // Hooded cloak: a triangle with a round head and a little lantern at the belt.
+    ctx.fillStyle = COLORS.playerCloak;
+    ctx.beginPath();
+    ctx.moveTo(14, 0);
+    ctx.lineTo(-10, -11);
+    ctx.lineTo(-10, 11);
+    ctx.closePath();
+    ctx.fill();
+    ctx.fillStyle = COLORS.player;
+    ctx.beginPath();
+    ctx.arc(1, 0, 7, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.fillStyle = COLORS.lanternCore;
+    ctx.beginPath();
+    ctx.arc(-4, 7, 3, 0, Math.PI * 2);
+    ctx.fill();
+    ctx.restore();
+    if (player.sneaking) {
+      ctx.fillStyle = 'rgba(242,232,213,0.85)';
+      ctx.font = '11px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('sneaking', player.x, player.y - 20);
+    }
+  }
+
+  function drawThrown(thrown, time) {
+    for (const t of thrown) {
+      ctx.fillStyle = '#ffd94a';
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, 4 + Math.sin(time * 10) * 1, 0, Math.PI * 2);
+      ctx.fill();
+      ctx.strokeStyle = 'rgba(255,217,74,0.6)';
+      ctx.lineWidth = 1;
+      ctx.beginPath();
+      ctx.arc(t.x, t.y, 12 + (1.2 - t.timer) * 30, 0, Math.PI * 2);
+      ctx.stroke();
+    }
+  }
+
+  /** The darkness pass: dim the whole floor, then cut light holes around the thief and lamps. */
+  function drawDarkness(state) {
+    dctx.clearRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
+    dctx.fillStyle = COLORS.shadow;
+    dctx.fillRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
+    dctx.globalCompositeOperation = 'destination-out';
     const p = state.player;
-    const glow = context.createRadialGradient(p.x, p.y, 4, p.x, p.y, 46);
-    glow.addColorStop(0, 'rgba(123, 92, 255, 0.30)');
-    glow.addColorStop(1, 'rgba(123, 92, 255, 0)');
-    context.fillStyle = glow;
-    context.fillRect(p.x - 46, p.y - 46, 92, 92);
-    context.save();
-    if (p.inBush) context.globalAlpha = 0.6;
-    context.fillStyle = PALETTE.playerCloak;
-    context.beginPath();
-    context.arc(p.x, p.y, 13, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = PALETTE.player;
-    context.beginPath();
-    context.arc(p.x + Math.cos(p.angle) * 4, p.y + Math.sin(p.angle) * 4, 8, 0, Math.PI * 2);
-    context.fill();
-    context.fillStyle = '#241a4d';
-    context.beginPath();
-    context.arc(p.x + Math.cos(p.angle) * 6, p.y + Math.sin(p.angle) * 6, 4, 0, Math.PI * 2);
-    context.fill();
-    context.restore();
-    if (p.running) {
-      context.strokeStyle = 'rgba(242, 239, 230, 0.5)';
-      context.lineWidth = 1.5;
-      context.beginPath();
-      context.arc(p.x, p.y, 19, 0, Math.PI * 2);
-      context.stroke();
+    let g = dctx.createRadialGradient(p.x, p.y, 30, p.x, p.y, 215);
+    g.addColorStop(0, 'rgba(0,0,0,1)');
+    g.addColorStop(1, 'rgba(0,0,0,0)');
+    dctx.fillStyle = g;
+    dctx.beginPath();
+    dctx.arc(p.x, p.y, 215, 0, Math.PI * 2);
+    dctx.fill();
+    for (const lamp of state.floor.lanterns) {
+      g = dctx.createRadialGradient(lamp.x, lamp.y, 10, lamp.x, lamp.y, 130);
+      g.addColorStop(0, 'rgba(0,0,0,0.9)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      dctx.fillStyle = g;
+      dctx.beginPath();
+      dctx.arc(lamp.x, lamp.y, 130, 0, Math.PI * 2);
+      dctx.fill();
     }
+    const e = state.floor.exit;
+    if (state.relicsTaken >= state.floor.relics.length) {
+      g = dctx.createRadialGradient(e.x, e.y, 10, e.x, e.y, 90);
+      g.addColorStop(0, 'rgba(0,0,0,0.9)');
+      g.addColorStop(1, 'rgba(0,0,0,0)');
+      dctx.fillStyle = g;
+      dctx.beginPath();
+      dctx.arc(e.x, e.y, 90, 0, Math.PI * 2);
+      dctx.fill();
+    }
+    dctx.globalCompositeOperation = 'source-over';
+    ctx.drawImage(dark, 0, 0);
   }
 
-  function drawGuards(state) {
-    for (const guard of state.guards) {
-      context.fillStyle = PALETTE.guardUniform;
-      context.beginPath();
-      context.arc(guard.x, guard.y, 14, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = PALETTE.guard;
-      context.beginPath();
-      context.arc(guard.x + Math.cos(guard.angle) * 4, guard.y + Math.sin(guard.angle) * 4, 8, 0, Math.PI * 2);
-      context.fill();
-      context.fillStyle = '#2b2f3a';
-      context.beginPath();
-      context.arc(guard.x + Math.cos(guard.angle) * 4, guard.y + Math.sin(guard.angle) * 4, 8, Math.PI * 0.9, Math.PI * 2.1);
-      context.fill();
-      // The detection ring over the guard's head: it fills as he gets sure of you.
-      if (guard.detection > 0.02) {
-        context.strokeStyle = guard.detection > 0.75 ? PALETTE.danger : PALETTE.gold;
-        context.lineWidth = 3;
-        context.beginPath();
-        context.arc(guard.x, guard.y, 20, -Math.PI / 2, -Math.PI / 2 + guard.detection * Math.PI * 2);
-        context.stroke();
-      }
-      if (guard.state === 'chase') {
-        text('!', guard.x, guard.y - 26, 26, PALETTE.danger, 'center');
-      } else if (guard.state === 'suspicious') {
-        text('?', guard.x, guard.y - 26, 24, PALETTE.gold, 'center');
-      }
+  function drawHud(state, time) {
+    ctx.fillStyle = COLORS.hud;
+    ctx.fillRect(0, 0, VIEW_WIDTH, 40);
+    ctx.fillStyle = COLORS.text;
+    ctx.font = 'bold 15px Georgia, serif';
+    ctx.textAlign = 'left';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(state.floor.name, 14, 21);
+    ctx.font = '14px Georgia, serif';
+    const right = [
+      `◆ ${state.relicsTaken}/${state.floor.relics.length}`,
+      `${'♥'.repeat(Math.max(0, state.lives))}${'·'.repeat(Math.max(0, GAME.lives - state.lives))}`,
+      `● ${state.coins.length}`,
+      `Score ${state.score}`,
+      `${Math.floor(state.floorTime / 60)}:${String(Math.floor(state.floorTime % 60)).padStart(2, '0')}`,
+    ].join('    ');
+    ctx.textAlign = 'right';
+    ctx.fillText(right, VIEW_WIDTH - 14, 21);
+    if (state.alarm) {
+      ctx.fillStyle = Math.sin(time * 8) > 0 ? 'rgba(200,30,20,0.9)' : 'rgba(140,20,10,0.9)';
+      ctx.fillRect(0, 40, VIEW_WIDTH, 26);
+      ctx.fillStyle = '#ffffff';
+      ctx.font = 'bold 15px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.fillText('— ALARM — guards are hunting you —', VIEW_WIDTH / 2, 54);
     }
-    for (const camera of state.cameras) {
-      context.fillStyle = '#3a4152';
-      context.fillRect(camera.x - 10, camera.y - 10, 20, 20);
-      context.save();
-      context.translate(camera.x, camera.y);
-      context.rotate(camera.angle);
-      context.fillStyle = '#c8ccd6';
-      context.fillRect(0, -5, 16, 10);
-      context.fillStyle = camera.detection > 0.45 ? PALETTE.danger : PALETTE.gold;
-      context.beginPath();
-      context.arc(16, 0, 3.5, 0, Math.PI * 2);
-      context.fill();
-      context.restore();
+    if (state.messageTimer > 0 && state.message) {
+      ctx.fillStyle = 'rgba(10,10,14,0.75)';
+      const w = ctx.measureText(state.message).width + 28;
+      ctx.fillRect((VIEW_WIDTH - w) / 2, VIEW_HEIGHT - 52, w, 32);
+      ctx.fillStyle = COLORS.text;
+      ctx.font = '14px Georgia, serif';
+      ctx.textAlign = 'center';
+      ctx.fillText(state.message, VIEW_WIDTH / 2, VIEW_HEIGHT - 35);
     }
+    ctx.textAlign = 'left';
   }
 
-  function drawHud(state) {
-    context.textBaseline = 'top';
-    text(scoreLabel(state.score), 20, 14, 24, PALETTE.text, 'left');
-    text(state.level.name, FIELD.width / 2, 14, 24, PALETTE.text, 'center');
-    // Relics: a diamond per relic, filled when stolen.
-    const total = state.relics.length;
-    const startX = FIELD.width - 220;
-    text('Relics', startX - 10, 14, 24, PALETTE.text, 'right');
-    for (let i = 0; i < total; i += 1) {
-      const x = startX + i * 26 + 13;
-      const y = 28;
-      context.save();
-      context.translate(x, y);
-      context.rotate(Math.PI / 4);
-      context.fillStyle = state.relics[i].taken ? PALETTE.relic : '#3a4152';
-      context.fillRect(-7, -7, 14, 14);
-      context.restore();
-    }
-    // Lives as hearts.
-    const livesX = FIELD.width - 220 + total * 26 + 16;
-    text('Lives', livesX - 6, 14, 24, PALETTE.text, 'left');
-    let hx = livesX + 58;
-    for (let i = 0; i < 3; i += 1) {
-      context.fillStyle = i < state.lives ? PALETTE.danger : '#3a4152';
-      context.beginPath();
-      context.arc(hx, 26, 7, 0, Math.PI * 2);
-      context.fill();
-      hx += 20;
-    }
-    // The loudest alarm in the room: a thin bar under the HUD.
-    let worst = 0;
-    for (const guard of state.guards) worst = Math.max(worst, guard.detection);
-    for (const camera of state.cameras) worst = Math.max(worst, camera.detection);
-    if (worst > 0.02) {
-      context.fillStyle = '#3a4152';
-      context.fillRect(FIELD.width / 2 - 120, 46, 240, 8);
-      context.fillStyle = worst > 0.75 ? PALETTE.danger : PALETTE.gold;
-      context.fillRect(FIELD.width / 2 - 120, 46, 240 * worst, 8);
-      text(worst > 0.75 ? 'SPOTTED' : 'SEEN', FIELD.width / 2 + 130, 42, 16, worst > 0.75 ? PALETTE.danger : PALETTE.gold, 'left');
-    }
-    // Coins left and the controls, along the bottom.
-    text(`Coins ${state.coinsLeft}  (click to toss one)`, 20, FIELD.height - 30, 17, PALETTE.muted, 'left');
-    text('WASD / arrows move   Shift run (loud)   P pause', FIELD.width - 20, FIELD.height - 30, 17, PALETTE.muted, 'right');
+  function overlay(title, lines, accent) {
+    ctx.fillStyle = 'rgba(6,8,16,0.55)';
+    ctx.fillRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
+    ctx.fillStyle = accent || COLORS.text;
+    ctx.font = 'bold 52px Georgia, serif';
+    ctx.textAlign = 'center';
+    ctx.textBaseline = 'middle';
+    ctx.fillText(title, VIEW_WIDTH / 2, VIEW_HEIGHT / 2 - 90);
+    ctx.fillStyle = COLORS.text;
+    ctx.font = '18px Georgia, serif';
+    lines.forEach((line, i) => {
+      ctx.fillText(line, VIEW_WIDTH / 2, VIEW_HEIGHT / 2 - 30 + i * 30);
+    });
+    ctx.fillStyle = COLORS.textDim;
+    ctx.font = '15px Georgia, serif';
+    ctx.fillText('Press Enter or click to continue', VIEW_WIDTH / 2, VIEW_HEIGHT - 70);
+    ctx.textAlign = 'left';
   }
 
-  function drawPanel(title, lines, prompt, accent) {
-    const height = PANEL.top + lines.length * PANEL.line + PANEL.bottom;
-    const x = (FIELD.width - PANEL.width) / 2;
-    const y = (FIELD.height - height) / 2;
-    context.fillStyle = PALETTE.panel;
-    context.fillRect(x, y, PANEL.width, height);
-    context.strokeStyle = PALETTE.panelEdge;
-    context.lineWidth = 2;
-    context.strokeRect(x, y, PANEL.width, height);
-    context.textBaseline = 'alphabetic';
-    text(title, FIELD.width / 2, y + 78, 46, accent || PALETTE.text, 'center');
-    for (let index = 0; index < lines.length; index += 1) {
-      text(lines[index], FIELD.width / 2, y + PANEL.top + index * PANEL.line, 20, PALETTE.muted, 'center');
-    }
-    text(prompt, FIELD.width / 2, y + height - 36, 22, PALETTE.gold, 'center');
-  }
-
-  const TITLE_LINES = [
-    'Three floors of the Old Museum. Steal every relic, slip out unseen.',
-    'Guards patrol with lantern cones. Bushes hide you, crates block sight.',
-    'Running is loud. Click to toss a coin and pull a guard away.',
-    'Cameras sweep the later floors. If a guard catches you, you lose a life.',
-    '',
-  ];
-  const PAUSED_LINES = ['The guards will wait for you.'];
-  const OVER_LINES = ['', ''];
-
-  /** Paint one frame: the floor, then the HUD or a panel for the screen the game is on. */
-  function draw(state, screen, best, info) {
-    const time = performance.now();
-    context.setTransform(1, 0, 0, 1, 0, 0);
-    context.fillStyle = PALETTE.backdrop;
-    context.fillRect(0, 0, canvas.width, canvas.height);
-    context.setTransform(view.scale, 0, 0, view.scale, view.x, view.y);
-    drawFloor(state);
-    drawCones(state);
-    drawWallsAndCover(state);
-    drawRelicsAndExit(state, time);
-    drawNoiseFlashes(state);
-    drawThrownCoin(state);
-    drawPlayer(state);
-    drawGuards(state);
+  function draw(state, screen, best, time) {
+    const floor = state.floor;
+    ctx.clearRect(0, 0, VIEW_WIDTH, VIEW_HEIGHT);
+    drawFloor(floor);
+    drawExit(floor, state.relicsTaken >= floor.relics.length, time);
+    drawRelics(floor, time);
+    drawCones(floor, state.guards, state.alarm);
+    for (const guard of state.guards) drawGuard(guard, state.alarm, time);
+    drawPlayer(state.player, time);
+    drawThrown(state.thrown, time);
+    drawDarkness(state);
     if (screen === SCREEN_TITLE) {
-      TITLE_LINES[4] = bestLabel(best);
-      drawPanel('LANTERN HEIST', TITLE_LINES, 'Press Space or click to start');
+      overlay('LANTERN HEIST', [
+        'A top-down stealth game in three floors.',
+        'Steal every relic, then slip out the green exit — unseen.',
+        'WASD / arrows to move · Shift to sneak · Q or click to toss a coin',
+        'Lantern light gives you away. Bushes hide you. Running is loud.',
+      ]);
+      ctx.fillStyle = COLORS.textDim;
+      ctx.font = '15px Georgia, serif';
+      ctx.textAlign = 'center';
+      if (best > 0) ctx.fillText(`Best score: ${best}`, VIEW_WIDTH / 2, VIEW_HEIGHT - 100);
+      ctx.textAlign = 'left';
       return;
     }
-    drawHud(state);
+    drawHud(state, time);
     if (screen === SCREEN_PAUSED) {
-      drawPanel('Paused', PAUSED_LINES, 'Press P to resume');
+      overlay('PAUSED', ['Take a breath. The guards wait for no one, but the game does.'], COLORS.text);
     } else if (screen === SCREEN_CLEAR) {
-      const lines = [
-        `${info.clearedName} cleared.`,
-        `Time bonus +${info.timeBonus}   ${info.ghost > 0 ? `Ghost bonus +${info.ghost}` : 'Spotted: no ghost bonus'}`,
-        `Score ${state.score}`,
-        '',
-      ];
-      drawPanel('Floor cleared', lines, info.win ? '' : 'Press Space for the next floor', PALETTE.ok);
+      overlay('FLOOR CLEARED', [`Score ${state.score}`, 'The next floor is darker. The guards are faster.'], COLORS.exitOpen);
     } else if (screen === SCREEN_OVER) {
-      OVER_LINES[0] = finalLabel(state.score);
-      OVER_LINES[1] = bestLabel(best);
-      drawPanel('Caught', OVER_LINES, 'Press Space or click to try again', PALETTE.danger);
+      overlay('CAUGHT', [`The manor keeps its relics this time.`, `Score ${state.score} · Best ${Math.max(best, state.score)}`], '#ff5040');
     } else if (screen === SCREEN_WIN) {
-      const lines = [
-        'Every relic is yours. The museum never knew you were there.',
-        finalLabel(state.score),
-        bestLabel(best),
-        '',
-      ];
-      drawPanel('Clean getaway', lines, 'Press Space or click to play again', PALETTE.gold);
+      const mins = Math.floor(state.totalTime / 60);
+      const secs = Math.floor(state.totalTime % 60);
+      overlay('THE HEIST IS DONE', [
+        'Every relic, every floor, and never once spotted.',
+        `Final score ${state.score} · Time ${mins}:${String(secs).padStart(2, '0')}`,
+        `Best ${Math.max(best, state.score)}`,
+      ], COLORS.relic);
     }
   }
 
-  resize();
-  window.addEventListener('resize', resize);
-  return { draw, view };
+  return { draw };
 }

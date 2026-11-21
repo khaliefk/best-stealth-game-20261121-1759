@@ -1,79 +1,76 @@
-// Keyboard and pointer input. Held keys give a steering direction; one-shot presses
-// (start, pause) are queued as bit flags and taken once by the loop, so a press between
-// two frames is never lost and never counted twice. A mouse click is queued as a coin
-// throw target in client coordinates; the loop turns it into world coordinates.
-
+// Lantern Heist: keyboard and mouse. WASD or arrows to move, Shift to sneak, Q or a click to
+// toss a coin toward the mouse, P or Escape to pause, Enter or a click to confirm, M to mute.
+// The input layer only records what is held and what was just pressed; the world decides what
+// any of it means.
 export const ACTION_CONFIRM = 1;
 export const ACTION_PAUSE = 2;
+export const ACTION_TOSS = 4;
+export const ACTION_MUTE = 8;
 
-const UP = new Set(['ArrowUp', 'KeyW']);
-const DOWN = new Set(['ArrowDown', 'KeyS']);
-const LEFT = new Set(['ArrowLeft', 'KeyA']);
-const RIGHT = new Set(['ArrowRight', 'KeyD']);
-const RUN = new Set(['ShiftLeft', 'ShiftRight']);
-const CONFIRM = new Set(['Space', 'Enter']);
-const PAUSE = new Set(['KeyP', 'Escape']);
-
-export function createInput(target) {
-  let up = false;
-  let down = false;
-  let left = false;
-  let right = false;
-  let run = false;
+export function createInput(canvas) {
+  const keys = new Set();
   let actions = 0;
-  let click = null;
+  let mouse = { x: 0, y: 0, clicked: false };
 
-  window.addEventListener('keydown', (event) => {
-    if (UP.has(event.code)) up = true;
-    else if (DOWN.has(event.code)) down = true;
-    else if (LEFT.has(event.code)) left = true;
-    else if (RIGHT.has(event.code)) right = true;
-    else if (RUN.has(event.code)) run = true;
-    else if (CONFIRM.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_CONFIRM;
-    } else if (PAUSE.has(event.code)) {
-      if (!event.repeat) actions |= ACTION_PAUSE;
-    } else return;
-    event.preventDefault();
-  });
-  window.addEventListener('keyup', (event) => {
-    if (UP.has(event.code)) up = false;
-    else if (DOWN.has(event.code)) down = false;
-    else if (LEFT.has(event.code)) left = false;
-    else if (RIGHT.has(event.code)) right = false;
-    else if (RUN.has(event.code)) run = false;
-  });
-  // A key released while the tab is hidden never sends keyup: let go of everything on blur.
-  window.addEventListener('blur', () => {
-    up = false;
-    down = false;
-    left = false;
-    right = false;
-    run = false;
-  });
-  target.addEventListener('pointerdown', (event) => {
+  function keyName(event) {
+    // Lowercase everything: 'Enter' and 'ArrowLeft' must match the lowercase names the
+    // game checks, and single letters come through lowercase already.
+    return event.key.toLowerCase();
+  }
+
+  function onKeyDown(event) {
+    const key = keyName(event);
+    if (['arrowup', 'arrowdown', 'arrowleft', 'arrowright', ' '].includes(key)) event.preventDefault();
+    if (event.repeat) return;
+    keys.add(key);
+    if (key === 'enter' || key === ' ') actions |= ACTION_CONFIRM;
+    if (key === 'p' || key === 'escape') actions |= ACTION_PAUSE;
+    if (key === 'q') actions |= ACTION_TOSS;
+    if (key === 'm') actions |= ACTION_MUTE;
+  }
+
+  function onKeyUp(event) {
+    keys.delete(keyName(event));
+  }
+
+  function onMouseMove(event) {
+    const rect = canvas.getBoundingClientRect();
+    mouse.x = ((event.clientX - rect.left) / rect.width) * canvas.width;
+    mouse.y = ((event.clientY - rect.top) / rect.height) * canvas.height;
+  }
+
+  function onMouseDown(event) {
+    onMouseMove(event);
+    mouse.clicked = true;
     actions |= ACTION_CONFIRM;
-    click = { clientX: event.clientX, clientY: event.clientY };
-  });
+    if (event.button === 0) actions |= ACTION_TOSS;
+  }
+
+  window.addEventListener('keydown', onKeyDown);
+  window.addEventListener('keyup', onKeyUp);
+  canvas.addEventListener('mousemove', onMouseMove);
+  canvas.addEventListener('mousedown', onMouseDown);
 
   return {
-    /** Move direction on each axis, -1, 0 or 1. */
-    move() {
-      return { mx: (right ? 1 : 0) - (left ? 1 : 0), my: (down ? 1 : 0) - (up ? 1 : 0) };
+    /** -1, 0 or 1 on each axis, from the keys held down right now. */
+    direction() {
+      const left = keys.has('a') || keys.has('arrowleft');
+      const right = keys.has('d') || keys.has('arrowright');
+      const up = keys.has('w') || keys.has('arrowup');
+      const down = keys.has('s') || keys.has('arrowdown');
+      return { x: (right ? 1 : 0) - (left ? 1 : 0), y: (down ? 1 : 0) - (up ? 1 : 0) };
     },
-    running() {
-      return run;
+    sneaking() {
+      return keys.has('shift');
     },
-    /** The one-shot presses since the last call, as ACTION_* flags. */
+    mouse() {
+      return mouse;
+    },
+    /** The actions pressed since the last read, then cleared. */
     takeActions() {
       const taken = actions;
       actions = 0;
-      return taken;
-    },
-    /** The last click's client coordinates, if any, since the last call. */
-    takeClick() {
-      const taken = click;
-      click = null;
+      mouse.clicked = false;
       return taken;
     },
   };

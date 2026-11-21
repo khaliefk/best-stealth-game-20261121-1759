@@ -1,107 +1,96 @@
-// Lantern Heist: every tuning number and colour in one place.
-// The playfield is a fixed 1280x720 logical area; the renderer scales it to the
-// window, so no rule below depends on the screen size.
-
-export const FIELD = { width: 1280, height: 720 };
-
-/** Tile size in pixels. Levels are 32 by 18 tiles. */
-export const TILE = 40;
-export const COLS = 32;
-export const ROWS = 18;
-
-/** The simulation's fixed step, in seconds: 60 updates a second whatever the display's rate. */
+// Lantern Heist: every number the game tunes on, in one place. Tile size, movement speeds,
+// vision and detection rates, lives and coins. Change a value here and the whole game follows.
+export const TILE = 32;
+export const COLS = 40;
+export const ROWS = 22;
+export const VIEW_WIDTH = COLS * TILE;
+export const VIEW_HEIGHT = ROWS * TILE;
 export const STEP = 1 / 60;
 
 export const PLAYER = {
-  radius: 13,
-  walkSpeed: 170,
-  runSpeed: 290,
-  /** How far a running footstep is heard, in pixels. Walking is silent. */
-  noiseRadius: 190,
+  walkSpeed: 150,
+  sneakSpeed: 82,
+  radius: 11,
 };
 
 export const GUARD = {
-  radius: 14,
-  patrolSpeed: 78,
-  chaseSpeed: 185,
-  investigateSpeed: 130,
-  /** How far a guard can see, in pixels. */
-  sightRange: 250,
-  /** Half-angle of the vision cone, in radians. */
-  sightHalfAngle: 0.46,
-  /** Detection fills per second when the player is fully in view. */
-  detectRate: 1.15,
-  /** Detection drains per second when the player is out of view. */
-  forgetRate: 0.35,
-  /** A player standing in a bush is this much harder to spot. */
-  bushFactor: 0.22,
-  /** Seconds a guard stares at the last seen spot before giving up. */
-  stareTime: 1.4,
-  /** Seconds a guard searches around a noise point before returning. */
-  searchTime: 3.0,
+  radius: 12,
+  // Patrol, chase and search speeds grow floor by floor (index 0, 1, 2).
+  patrolSpeed: [68, 84, 100],
+  chaseSpeed: [128, 144, 160],
+  searchSpeed: [95, 105, 115],
+  // How long a guard waits at each patrol waypoint, in seconds.
+  waitAtWaypoint: [1.6, 1.2, 0.9],
+  // How long a guard searches the last place it saw the thief.
+  searchTime: 3.5,
+  // How long without a sighting before the alarm dies down.
+  alarmCalmTime: 4,
 };
 
-export const CAMERA = {
-  radius: 10,
-  sightRange: 230,
-  sightHalfAngle: 0.42,
-  /** Radians per second the camera sweeps. */
-  sweepSpeed: 0.55,
-  detectRate: 1.5,
+export const VISION = {
+  range: 196,
+  // Half of the cone's angle, in radians: the full cone is about 70 degrees wide.
+  halfAngle: 0.61,
+  // Suspicion fills 0..1. The base fill rate at point-blank range, per second.
+  fillBase: 1.15,
+  // Filling slows with distance: at full range it is this fraction of the base rate.
+  fillFar: 0.35,
+  // Standing in a lantern's light fills suspicion faster; deep shadow fills it slower.
+  fillInLight: 1.6,
+  fillInShadow: 0.7,
+  // Sneaking halves the fill rate; a bush hides the thief unless a guard is very close.
+  fillSneaking: 0.5,
+  bushRevealRange: 52,
+  // Suspicion drains this fast per second while the thief is unseen.
+  drain: 0.45,
+  // A running thief is heard this far away; a sneaking one is not heard at all.
+  noiseRadius: 112,
 };
 
-export const LIVES = 3;
-export const COINS_PER_LEVEL = 3;
-/** How far a thrown coin's clink carries, in pixels. */
-export const COIN_NOISE_RADIUS = 260;
-/** How far a coin flies from the player, in pixels. */
-export const COIN_THROW_RANGE = 320;
-
-export const RELIC_POINTS = 100;
-export const GHOST_BONUS = 150;
-export const LEVEL_TIME_BONUS_PER_SECOND = 2;
-
-/** Seconds of play that count as a par time for the time bonus. */
-export const PAR_TIME = 75;
-
-export const PALETTE = {
-  backdrop: '#0b0d12',
-  floorA: '#20242e',
-  floorB: '#1c2029',
-  floorLine: '#262b38',
-  wall: '#3a4152',
-  wallTop: '#4d566e',
-  crate: '#6b4f2a',
-  crateTop: '#8a6a3a',
-  crateEdge: '#4a3419',
-  bush: '#1d3a24',
-  bushLeaf: '#2c5a35',
-  bushDeep: '#142a1a',
-  lampGlow: '#f7c948',
-  relic: '#ffd94d',
-  relicGlow: '#ffedb0',
-  exit: '#39d98a',
-  exitLocked: '#5a6b62',
-  player: '#7b5cff',
-  playerCloak: '#4a3496',
-  guard: '#e8e4d8',
-  guardUniform: '#c94f42',
-  coneCalm: 'rgba(247, 201, 72, 0.20)',
-  coneCalmEdge: 'rgba(247, 201, 72, 0.55)',
-  coneSuspicious: 'rgba(255, 149, 0, 0.30)',
-  coneSuspiciousEdge: 'rgba(255, 149, 0, 0.75)',
-  coneAlert: 'rgba(255, 59, 48, 0.34)',
-  coneAlertEdge: 'rgba(255, 59, 48, 0.9)',
-  panel: '#171a21',
-  panelEdge: '#2e3442',
-  text: '#f2efe6',
-  muted: '#9aa1b0',
-  gold: '#f7c948',
-  danger: '#ff5a4e',
-  ok: '#39d98a',
+export const GAME = {
+  lives: 3,
+  coinsPerFloor: 3,
+  // How far a thrown coin flies and how far its ping carries.
+  coinThrow: 150,
+  coinPingRadius: 230,
+  // How long guards stay curious about a coin ping, in seconds.
+  coinCuriousTime: 4,
+  relicScore: 1000,
+  floorClearScore: 500,
+  ghostBonus: 500,
+  // One point per second left under the floor's par time.
+  parTime: [150, 180, 210],
+  bestKey: 'lantern-heist-best',
 };
 
-export const FONT = 'system-ui, -apple-system, "Segoe UI", sans-serif';
-
-/** Where the best score is kept between visits (this browser only). */
-export const BEST_KEY = 'lantern-heist.best';
+// The palette. Floors are dark wood and stone; light is warm amber, danger is red, safety is green.
+export const COLORS = {
+  floorA: '#3d2f21',
+  floorB: '#453626',
+  floorDark: '#2e2115',
+  wall: '#5d5344',
+  wallTop: '#7d7260',
+  wallDark: '#3d3226',
+  crate: '#7a5230',
+  crateEdge: '#54371d',
+  table: '#5d3f24',
+  bush: '#1f4d2a',
+  bushLight: '#2f6b3a',
+  lanternGlow: 'rgba(255, 190, 90, 0.20)',
+  lanternCore: '#ffd27a',
+  relic: '#ffd94a',
+  relicGlow: 'rgba(255, 217, 74, 0.30)',
+  exitLocked: '#c0392b',
+  exitOpen: '#2ecc71',
+  player: '#e8c96a',
+  playerCloak: '#3d2b52',
+  guard: '#3a5a8c',
+  guardHelmet: '#9aa7b8',
+  coneCalm: 'rgba(255, 214, 90, 0.30)',
+  coneSuspicious: 'rgba(255, 150, 40, 0.40)',
+  coneAlarm: 'rgba(255, 60, 50, 0.48)',
+  shadow: 'rgba(6, 8, 16, 0.32)',
+  hud: 'rgba(10, 10, 14, 0.78)',
+  text: '#f2e8d5',
+  textDim: '#b8a888',
+};

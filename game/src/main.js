@@ -1,41 +1,70 @@
-// Boot and the one loop: input is read every frame, the world advances in fixed 1/60 s
-// steps (several in a slow frame, none in a fast one), and the renderer paints what is
-// there. The game moves between six screens: title, play, paused, floor cleared, game
-// over and clean getaway.
+// Lantern Heist: boot and the one loop. Input is read every frame, the world advances in fixed
+// 1/60 s steps, and the renderer paints what is there. The game moves between six screens:
+// title, play, paused, floor cleared, caught and victory.
 //
-// ?seed=N is accepted and ignored (the levels are fixed); ?shot=start|play|alert|win
-// stages that scene instead of running the loop, paints it twice and sets
-// window.__shotReady for a screenshot.
-import { BEST_KEY, FIELD, STEP } from './config.js';
-import { createWorld, EVENT_CAUGHT, EVENT_GAME_OVER, EVENT_LEVEL_CLEAR, EVENT_WIN } from './world.js';
-import { ACTION_CONFIRM, ACTION_PAUSE, createInput } from './input.js';
-import { createAudio } from './audio.js';
+// ?seed=N fixes the guards' starting phase. ?shot=start|play|alarm|win (with &seed=N) stages
+// that scene instead of running the loop, paints it twice and sets window.__shotReady.
+import { GAME, STEP } from './config.js';
+import { createWorld, EVENT_ALARM, EVENT_CAUGHT, EVENT_CLEAR, EVENT_OVER, EVENT_WIN } from './world.js';
+import { ACTION_CONFIRM, ACTION_MUTE, ACTION_PAUSE, ACTION_TOSS, createInput } from './input.js';
 import {
-  createRenderer,
   SCREEN_CLEAR,
   SCREEN_OVER,
   SCREEN_PAUSED,
   SCREEN_PLAY,
   SCREEN_TITLE,
   SCREEN_WIN,
+  createRenderer,
 } from './render.js';
 import { stageShot } from './shots.js';
+import { toggleMute, unlockAudio } from './audio.js';
 
-/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped, not replayed. */
+/** The longest frame the loop catches up on; a longer stall (a hidden tab) is dropped. */
 const MAX_FRAME = 0.25;
+
+/** A small seeded generator, so ?seed=N always stages the same frame. */
+function mulberry32(seed) {
+  let a = seed >>> 0;
+  return function random() {
+    a |= 0;
+    a = (a + 0x6d2b79f5) | 0;
+    let t = Math.imul(a ^ (a >>> 15), 1 | a);
+    t = (t + Math.imul(t ^ (t >>> 7), 61 | t)) ^ t;
+    return ((t ^ (t >>> 14)) >>> 0) / 4294967296;
+  };
+}
 
 const params = new URLSearchParams(window.location.search);
 const shot = params.get('shot');
+const seedParam = Number.parseInt(params.get('seed') ?? '', 10);
+const seed = Number.isInteger(seedParam) ? seedParam : Math.floor(Math.random() * 4294967296);
+const random = mulberry32(seed);
+const originalRandom = Math.random;
+Math.random = random;
 
 const canvas = document.getElementById('game');
 const status = document.getElementById('status');
 const world = createWorld();
 const renderer = createRenderer(canvas);
-const audio = createAudio();
+
+// A tiny read-only hook for automated playtests: position, alarm, lives, relics, floor, score.
+window.__debugState = () => ({
+  x: Math.round(world.state.player.x),
+  y: Math.round(world.state.player.y),
+  alarm: world.state.alarm,
+  lives: world.state.lives,
+  relics: world.state.relicsTaken,
+  floor: world.state.floorIndex,
+  score: world.state.score,
+  over: world.state.over,
+  won: world.state.won,
+});
+
+Math.random = originalRandom;
 
 function readBest() {
   try {
-    return Number.parseInt(window.localStorage.getItem(BEST_KEY) ?? '0', 10) || 0;
+    return Number.parseInt(window.localStorage.getItem(GAME.bestKey) ?? '0', 10) || 0;
   } catch {
     return 0;
   }
@@ -43,7 +72,7 @@ function readBest() {
 
 function saveBest(value) {
   try {
-    window.localStorage.setItem(BEST_KEY, String(value));
+    window.localStorage.setItem(GAME.bestKey, String(value));
   } catch {
     // Storage can be off (private windows): the best score then lasts this visit only.
   }
@@ -51,10 +80,9 @@ function saveBest(value) {
 
 function runShot(name) {
   const scene = stageShot(name, world);
-  window.__game = { world, screen: scene.screen };
   let painted = 0;
   function paint() {
-    renderer.draw(world.state, scene.screen, scene.best, scene.info);
+    renderer.draw(world.state, scene.screen, scene.best, 0);
     painted += 1;
     if (painted < 2) requestAnimationFrame(paint);
     else window.__shotReady = true;
@@ -66,130 +94,98 @@ function runGame() {
   const input = createInput(canvas);
   let screen = SCREEN_TITLE;
   let best = readBest();
-  let clearInfo = null;
   let accumulator = 0;
   let last = performance.now();
+  let time = 0;
+  let clearShownAt = 0;
 
-  // Screen readers (and anyone watching the page's text) hear the screen changes.
   function announce(message) {
     status.textContent = message;
   }
 
-  /** Turn a click's client coordinates into world coordinates on the playfield. */
-  function toWorld(clientX, clientY) {
-    const rect = canvas.getBoundingClientRect();
-    const ratio = window.devicePixelRatio || 1;
-    const view = renderer.view;
-    return {
-      x: ((clientX - rect.left) * ratio - view.x) / view.scale,
-      y: ((clientY - rect.top) * ratio - view.y) / view.scale,
-    };
-  }
-
-  function drainSounds() {
-    const events = world.state.events;
-    const p = world.state.player;
-    for (const event of events) {
-      if (event.type === 'playerStep') audio.playerStep(event.loud);
-      else if (event.type === 'guardStep') audio.guardStep(Math.hypot(event.x - p.x, event.y - p.y));
-      else if (event.type === 'relic') audio.relic();
-      else if (event.type === 'coinLand') audio.coinLand();
-      else if (event.type === 'spotted') audio.spotted();
-      else if (event.type === 'caught') audio.caught();
-      else if (event.type === 'levelClear') audio.levelClear();
-    }
-    events.length = 0;
-  }
-
   function startGame() {
-    world.resetRun();
-    clearInfo = null;
+    unlockAudio();
+    world.reset();
     accumulator = 0;
     screen = SCREEN_PLAY;
-    audio.unlock();
-    announce(`Playing. ${world.state.level.name}. Steal every relic, then reach the exit.`);
+    announce(`Playing. ${GAME.lives} lives. Steal every relic, then reach the exit.`);
   }
 
-  function endGame(won) {
-    screen = won ? SCREEN_WIN : SCREEN_OVER;
+  function finishRun() {
     if (world.state.score > best) {
       best = world.state.score;
       saveBest(best);
     }
-    if (won) audio.win();
-    announce(won ? `Clean getaway. Score ${world.state.score}.` : `Caught. Score ${world.state.score}. Best ${best}.`);
   }
 
-  function handleActions() {
-    const actions = input.takeActions();
-    const click = input.takeClick();
-    if (screen === SCREEN_PLAY && click) {
-      const target = toWorld(click.clientX, click.clientY);
-      if (target.x >= 0 && target.y >= 0 && target.x <= FIELD.width && target.y <= FIELD.height) {
-        world.state.pendingThrow = target;
-      }
+  function step(dt, dir, sneaking, toss) {
+    const events = world.step(dt, dir, sneaking, toss);
+    if (events & EVENT_ALARM) announce('Spotted! Break line of sight!');
+    if (events & EVENT_CAUGHT) announce(`Caught. ${world.state.lives} lives left.`);
+    if (events & EVENT_CLEAR) {
+      screen = SCREEN_CLEAR;
+      clearShownAt = time;
+      announce('Floor cleared.');
     }
-    if (actions & ACTION_CONFIRM && screen === SCREEN_TITLE) startGame();
-    else if (actions & ACTION_CONFIRM && screen === SCREEN_OVER) startGame();
-    else if (actions & ACTION_CONFIRM && screen === SCREEN_WIN) startGame();
-    else if (actions & ACTION_CONFIRM && screen === SCREEN_CLEAR) {
-      clearInfo = null;
-      screen = SCREEN_PLAY;
-      announce(`Playing. ${world.state.level.name}.`);
+    if (events & EVENT_WIN) {
+      screen = SCREEN_WIN;
+      finishRun();
+      announce('The heist is done.');
+    }
+    if (events & EVENT_OVER) {
+      screen = SCREEN_OVER;
+      finishRun();
+      announce(`Caught. Game over. Score ${world.state.score}.`);
+    }
+  }
+
+  function frame(now) {
+    requestAnimationFrame(frame);
+    const dt = Math.min((now - last) / 1000, MAX_FRAME);
+    last = now;
+    time += dt;
+    const clicked = input.mouse().clicked;
+    const actions = input.takeActions();
+    const wasPlaying = screen === SCREEN_PLAY;
+    if (actions & ACTION_MUTE) {
+      const muted = toggleMute();
+      announce(muted ? 'Muted.' : 'Sound on.');
+    }
+    if (actions & ACTION_CONFIRM && (screen === SCREEN_TITLE || screen === SCREEN_OVER || screen === SCREEN_WIN)) {
+      startGame();
     } else if (actions & ACTION_PAUSE && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
       announce('Paused.');
     } else if (actions & (ACTION_PAUSE | ACTION_CONFIRM) && screen === SCREEN_PAUSED) {
       screen = SCREEN_PLAY;
       announce('Playing.');
+    } else if (screen === SCREEN_CLEAR && time - clearShownAt > 2.2) {
+      screen = SCREEN_PLAY;
     }
-  }
-
-  function step() {
     if (screen === SCREEN_TITLE) {
-      // The title screen's backdrop: guards patrol, nothing can catch the player.
-      const events = world.step(STEP, { mx: 0, my: 0, run: false, throwCoin: null });
-      void events;
-      world.state.events.length = 0;
-      return;
-    }
-    const move = input.move();
-    const throwCoin = world.state.pendingThrow ?? null;
-    world.state.pendingThrow = null;
-    const events = world.step(STEP, { mx: move.mx, my: move.my, run: input.running(), throwCoin });
-    drainSounds();
-    if (events & EVENT_LEVEL_CLEAR) {
-      clearInfo = world.state.lastClear || null;
-      if (events & EVENT_WIN) {
-        endGame(true);
-      } else {
-        screen = SCREEN_CLEAR;
-        announce(`${clearInfo ? clearInfo.clearedName : 'Floor'} cleared.`);
+      // The manor lives behind the title card: guards keep patrolling.
+      world.step(dt, { x: 0, y: 0 }, false, null);
+    } else if (screen === SCREEN_PLAY) {
+      let toss = null;
+      if (wasPlaying && actions & ACTION_TOSS) {
+        const p = world.state.player;
+        const angle = clicked
+          ? Math.atan2(input.mouse().y - p.y, input.mouse().x - p.x)
+          : p.facing;
+        toss = { angle };
       }
-    } else if (events & EVENT_GAME_OVER) {
-      endGame(false);
-    } else if (events & EVENT_CAUGHT) {
-      announce(`Caught. ${world.state.lives} ${world.state.lives === 1 ? 'life' : 'lives'} left.`);
-    }
-  }
-
-  function frame(now) {
-    requestAnimationFrame(frame);
-    accumulator += Math.min((now - last) / 1000, MAX_FRAME);
-    last = now;
-    handleActions();
-    if (screen === SCREEN_TITLE || screen === SCREEN_PLAY) {
-      while (accumulator >= STEP && (screen === SCREEN_TITLE || screen === SCREEN_PLAY)) {
-        step();
+      accumulator += dt;
+      while (accumulator >= STEP && screen === SCREEN_PLAY) {
+        step(STEP, input.direction(), input.sneaking(), toss);
+        toss = null;
         accumulator -= STEP;
       }
     } else {
       accumulator = 0;
     }
-    renderer.draw(world.state, screen, best, clearInfo);
+    renderer.draw(world.state, screen, best, time);
   }
 
-  // Leaving the tab pauses a running game rather than letting guards walk unseen.
   document.addEventListener('visibilitychange', () => {
     if (document.hidden && screen === SCREEN_PLAY) {
       screen = SCREEN_PAUSED;
@@ -197,9 +193,7 @@ function runGame() {
     }
   });
 
-  announce('Lantern Heist. Press Space or click to start.');
-  // A handle for automated playtests: the world and the current screen, read-only.
-  window.__game = { world, get screen() { return screen; } };
+  announce('Lantern Heist. Press Enter or click to start.');
   requestAnimationFrame(frame);
 }
 
